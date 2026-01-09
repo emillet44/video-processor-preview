@@ -1,0 +1,11 @@
+{
+  "name": "video-processor",  
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.0.0",
+    "@google-cloud/storage": "^7.0.0",
+    "uuid": "^9.0.0",
+    "canvas": "^2.11.2"
+  }
+}
