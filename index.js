@@ -100,11 +100,15 @@ functions.http('processVideos', async (req, res) => {
   const tracker = new ProgressTracker(res);
   
   try {
+    // 1. Download
+    tracker.update('Downloading fragments...', 15);
     const local = await Promise.all(filePaths.map(async (fp, i) => {
       const p = `/tmp/i_${i}_${uuidv4()}.mp4`;
       await cacheBucket.file(fp).download({ destination: p }); return p;
     }));
 
+    // 2. Render
+    tracker.update('Rendering 720p previews...', 45);
     const processed = await Promise.all(local.map(async (f, i) => {
       const out = `/tmp/p_${i}_${uuidv4()}.mp4`, ov = `/tmp/o_${i}_${uuidv4()}.png`;
       fs.writeFileSync(ov, createTextOverlayImage(title, ranks, i + 1, 720, 1280).toBuffer('image/png'));
@@ -116,10 +120,14 @@ functions.http('processVideos', async (req, res) => {
       return out;
     }));
 
+    // 3. Concat
+    tracker.update('Stitching video...', 80);
     const final = `/tmp/f_${uuidv4()}.mp4`, list = `/tmp/l_${uuidv4()}.txt`;
     fs.writeFileSync(list, processed.map(p => `file '${p}'`).join('\n'));
     await new Promise(r => spawn('ffmpeg', ['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-y', final]).on('close', r));
-    
+
+    // 4. Upload
+    tracker.update('Finalizing upload...', 95);
     await outputBucket.upload(final, { destination: `${sessionId}.mp4` });
     const [url] = await outputBucket.file(`${sessionId}.mp4`).getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 3600000 });
     
