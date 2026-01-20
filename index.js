@@ -24,7 +24,7 @@ const LAYOUT_CONFIG = {
   rankMaxLines: 1, rankColors: ['#FFD700', '#C0C0C0', '#CD7F32', 'white', 'white'],
   watermarkText: 'ranktop.net', watermarkFontSize: 48, watermarkPadding: 20,
   fontPath: '/usr/share/fonts/truetype/font.ttf',
-  fallbackFontPath: '/usr/share/fonts/truetype/NotoSans-Regular.ttf', // Put this file in your repo
+  fallbackFontPath: '/usr/share/fonts/truetype/NotoSans-Regular.ttf',
   textOutlineWidth: 12
 };
 
