@@ -4,7 +4,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const { createCanvas, registerFont } = require('canvas');
+const { createCanvas, registerFont, loadImage } = require('canvas');
 
 const storage = new Storage();
 const cacheBucket = storage.bucket('ranktop-v-cache');
@@ -12,11 +12,11 @@ const outputBucket = storage.bucket('ranktop-v-preview');
 
 const LAYOUT_CONFIG = {
   fontPath: '/usr/share/fonts/truetype/custom/font.ttf',
-  // System names provided by fonts-noto-cjk and fonts-noto-color-emoji
   chineseFont: 'Noto Sans CJK SC',
-  emojiFont: 'Noto Color Emoji',
   rankColors: ['#FFD700', '#C0C0C0', '#CD7F32', 'white', 'white']
 };
+
+const emojiCache = new Map();
 
 // --- Font Registration ---
 if (fs.existsSync(LAYOUT_CONFIG.fontPath)) {
@@ -25,30 +25,28 @@ if (fs.existsSync(LAYOUT_CONFIG.fontPath)) {
   throw new Error(`Main font missing at ${LAYOUT_CONFIG.fontPath}`);
 }
 
-// --- Text Utilities ---
+// --- Text & Emoji Utilities ---
 
-/**
- * Returns the font family name based on the character type.
- */
+function getEmojiUrl(emoji) {
+  // Extract hex code points for Twemoji CDN
+  const codePoints = Array.from(emoji)
+    .map(c => c.codePointAt(0).toString(16))
+    .join('-');
+  return `https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.0.3/assets/72x72/${codePoints}.png`;
+}
+
 function getFontForChar(char) {
-  // Regex for Chinese/Japanese/Korean characters
   const isCJK = /[\u4e00-\u9fa5]|[\u3040-\u30ff]|[\uff00-\uffef]/.test(char);
-  // Regex for Emojis
   const isEmoji = /\p{Extended_Pictographic}/u.test(char);
-
-  if (isEmoji) return LAYOUT_CONFIG.emojiFont;
+  if (isEmoji) return 'Emoji';
   if (isCJK) return LAYOUT_CONFIG.chineseFont;
   return 'CustomFont';
 }
 
-/**
- * Splits text into segments where each segment uses the same font.
- */
 function segmentTextByFont(text) {
   const segments = [];
   if (!text) return segments;
   let currentSegment = { text: '', font: '' };
-
   for (const char of text) {
     const fontNeeded = getFontForChar(char);
     if (currentSegment.text === '') {
@@ -68,26 +66,51 @@ function measureMixedText(ctx, text, fontSize) {
   const segments = segmentTextByFont(text);
   let totalWidth = 0;
   segments.forEach(s => {
-    ctx.font = `${fontSize}px "${s.font}"`;
-    totalWidth += ctx.measureText(s.text).width;
+    if (s.font === 'Emoji') {
+      totalWidth += (fontSize * Array.from(s.text).length);
+    } else {
+      ctx.font = `${fontSize}px "${s.font}"`;
+      totalWidth += ctx.measureText(s.text).width;
+    }
   });
   return totalWidth;
 }
 
-function drawMixedText(ctx, text, x, y, fontSize, fillStyle, strokeStyle = null, lineWidth = 0) {
+async function drawMixedText(ctx, text, x, y, fontSize, fillStyle, strokeStyle = null, lineWidth = 0) {
   const segments = segmentTextByFont(text);
   let currentX = x;
-  segments.forEach(s => {
-    ctx.font = `${fontSize}px "${s.font}"`;
-    if (strokeStyle && lineWidth > 0) {
-      ctx.strokeStyle = strokeStyle;
-      ctx.lineWidth = lineWidth;
-      ctx.strokeText(s.text, currentX, y);
+
+  for (const s of segments) {
+    if (s.font === 'Emoji') {
+      const emojis = Array.from(s.text);
+      for (const emoji of emojis) {
+        try {
+          const url = getEmojiUrl(emoji);
+          let img = emojiCache.get(url);
+          if (!img) {
+            img = await loadImage(url);
+            emojiCache.set(url, img);
+          }
+          const emojiSize = fontSize * 1.1;
+          // Vertically center emoji with text
+          ctx.drawImage(img, currentX, y + (fontSize * 0.1), fontSize, fontSize);
+          currentX += fontSize;
+        } catch (e) {
+          currentX += fontSize;
+        }
+      }
+    } else {
+      ctx.font = `${fontSize}px "${s.font}"`;
+      if (strokeStyle && lineWidth > 0) {
+        ctx.strokeStyle = strokeStyle;
+        ctx.lineWidth = lineWidth;
+        ctx.strokeText(s.text, currentX, y);
+      }
+      ctx.fillStyle = fillStyle;
+      ctx.fillText(s.text, currentX, y);
+      currentX += ctx.measureText(s.text).width;
     }
-    ctx.fillStyle = fillStyle;
-    ctx.fillText(s.text, currentX, y);
-    currentX += ctx.measureText(s.text).width;
-  });
+  }
 }
 
 function fitTextToBox(text, boxWidth, maxLines, initialFontSize) {
@@ -106,7 +129,7 @@ function fitTextToBox(text, boxWidth, maxLines, initialFontSize) {
   return { fontSize: 10, lines: [text] };
 }
 
-function createTextOverlayImage(title, ranks, ranksToShow, targetW, targetH) {
+async function createTextOverlayImage(title, ranks, ranksToShow, targetW, targetH) {
   const canvas = createCanvas(targetW, targetH);
   const ctx = canvas.getContext('2d');
   const scale = targetW / 1080;
@@ -119,31 +142,29 @@ function createTextOverlayImage(title, ranks, ranksToShow, targetW, targetH) {
 
   ctx.fillStyle = 'black'; ctx.fillRect(0, 0, targetW, boxH);
   let currY = (boxH - textH) / 2;
-  titleRes.lines.forEach(l => {
+  for (const l of titleRes.lines) {
     const lw = measureMixedText(ctx, l, titleRes.fontSize);
-    drawMixedText(ctx, l, (targetW - lw) / 2, currY, titleRes.fontSize, 'white');
+    await drawMixedText(ctx, l, (targetW - lw) / 2, currY, titleRes.fontSize, 'white');
     currY += titleRes.fontSize + (60 * scale);
-  });
+  }
 
   for (let i = 0; i < ranksToShow; i++) {
     const idx = (ranks.length - ranksToShow) + i;
     const y = (80 * scale) + boxH + (idx * 140 * scale);
     const rRes = fitTextToBox(ranks[idx], 830 * scale, 1, 60 * scale);
     
-    // Draw Rank Number (Always using CustomFont)
     ctx.font = `${60 * scale}px "CustomFont"`;
     ctx.strokeStyle = 'black'; ctx.lineWidth = 12 * scale;
     ctx.strokeText(`${idx + 1}.`, 45 * scale, y);
     ctx.fillStyle = LAYOUT_CONFIG.rankColors[idx] || 'white';
     ctx.fillText(`${idx + 1}.`, 45 * scale, y);
     
-    // Draw Rank Text (Mixed)
-    drawMixedText(ctx, rRes.lines[0], 125 * scale, y, rRes.fontSize, 'white', 'black', 12 * scale);
+    await drawMixedText(ctx, rRes.lines[0], 125 * scale, y, rRes.fontSize, 'white', 'black', 12 * scale);
   }
   return canvas;
 }
 
-// --- Main Function ---
+// --- Main HTTP Function ---
 functions.http('processVideos', async (req, res) => {
   res.set({ 
     'Access-Control-Allow-Origin': '*', 
@@ -173,7 +194,6 @@ functions.http('processVideos', async (req, res) => {
 
   try {
     const totalSteps = filePaths.length;
-    
     tracker.update('Downloading fragments...', 5);
     const local = await Promise.all(filePaths.map(async (fp, i) => {
       const p = `/tmp/i_${i}_${uuidv4()}.mp4`;
@@ -181,7 +201,6 @@ functions.http('processVideos', async (req, res) => {
       tempFiles.push(p);
       return p;
     }));
-    tracker.update('Download complete', 15);
 
     const processed = [];
     for (let i = 0; i < local.length; i++) {
@@ -193,7 +212,8 @@ functions.http('processVideos', async (req, res) => {
       const renderProgress = 15 + Math.floor(((i) / totalSteps) * 60);
       tracker.update(`Rendering fragment ${i + 1} of ${totalSteps}...`, renderProgress);
 
-      fs.writeFileSync(ov, createTextOverlayImage(title, ranks, i + 1, 720, 1280).toBuffer('image/png'));
+      const overlayCanvas = await createTextOverlayImage(title, ranks, i + 1, 720, 1280);
+      fs.writeFileSync(ov, overlayCanvas.toBuffer('image/png'));
       
       await new Promise((resolve, reject) => {
         const filter = `[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280[v];[1:v]scale=720:1280[ov];[v][ov]overlay=0:0`;
@@ -201,7 +221,6 @@ functions.http('processVideos', async (req, res) => {
             '-i', f, '-i', ov, '-filter_complex', filter, 
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-y', out
         ]);
-        
         ff.on('error', reject);
         ff.on('close', c => {
             try { if (fs.existsSync(ov)) fs.unlinkSync(ov); } catch(e) {}
@@ -209,12 +228,10 @@ functions.http('processVideos', async (req, res) => {
         });
       });
       processed.push(out);
-      
-      const postRenderProgress = 15 + Math.floor(((i + 1) / totalSteps) * 60);
-      tracker.update(`Fragment ${i + 1} processed`, postRenderProgress);
+      tracker.update(`Fragment ${i + 1} processed`, 15 + Math.floor(((i + 1) / totalSteps) * 60));
     }
 
-    tracker.update('Stitching segments together...', 75);
+    tracker.update('Stitching segments...', 75);
     const final = `/tmp/f_${uuidv4()}.mp4`, list = `/tmp/l_${uuidv4()}.txt`;
     tempFiles.push(final, list);
     fs.writeFileSync(list, processed.map(p => `file '${p}'`).join('\n'));
@@ -224,13 +241,12 @@ functions.http('processVideos', async (req, res) => {
         .on('error', reject)
         .on('close', resolve);
     });
-    tracker.update('Stitching complete', 90);
 
-    tracker.update('Finalizing video upload...', 92);
+    tracker.update('Finalizing upload...', 92);
     await outputBucket.upload(final, { destination: `${sessionId}.mp4` });
     const [url] = await outputBucket.file(`${sessionId}.mp4`).getSignedUrl({ 
         version: 'v4', action: 'read', expires: Date.now() + 3600000 
-      });
+    });
     
     tracker.complete(url);
   } catch (e) { 
@@ -238,20 +254,13 @@ functions.http('processVideos', async (req, res) => {
     tracker.error(e.message); 
   } finally {
     tempFiles.forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {} });
+    emojiCache.clear();
   }
 });
 
 class ProgressTracker {
   constructor(res) { this.res = res; }
-  update(msg, prog) { 
-    this.res.write(`data: ${JSON.stringify({ message: msg, progress: prog })}\n\n`); 
-  }
-  complete(url) { 
-    this.res.write(`data: ${JSON.stringify({ complete: true, videoUrl: url, progress: 100 })}\n\n`); 
-    this.res.end(); 
-  }
-  error(e) { 
-    this.res.write(`data: ${JSON.stringify({ error: e })}\n\n`); 
-    this.res.end(); 
-  }
+  update(msg, prog) { this.res.write(`data: ${JSON.stringify({ message: msg, progress: prog })}\n\n`); }
+  complete(url) { this.res.write(`data: ${JSON.stringify({ complete: true, videoUrl: url, progress: 100 })}\n\n`); this.res.end(); }
+  error(e) { this.res.write(`data: ${JSON.stringify({ error: e })}\n\n`); this.res.end(); }
 }
