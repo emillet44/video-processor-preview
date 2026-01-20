@@ -23,21 +23,98 @@ const LAYOUT_CONFIG = {
   rankPaddingY: 80, rankSpacing: 140, rankNumX: 45, rankTextX: 125, rankBoxWidth: 830,
   rankMaxLines: 1, rankColors: ['#FFD700', '#C0C0C0', '#CD7F32', 'white', 'white'],
   watermarkText: 'ranktop.net', watermarkFontSize: 48, watermarkPadding: 20,
-  fontPath: '/usr/share/fonts/truetype/font.ttf', textOutlineWidth: 12
+  fontPath: '/usr/share/fonts/truetype/font.ttf',
+  fallbackFontPath: '/usr/share/fonts/truetype/NotoSans-Regular.ttf', // Put this file in your repo
+  textOutlineWidth: 12
 };
 
 if (!fs.existsSync(LAYOUT_CONFIG.fontPath)) throw new Error(`Font missing`);
 registerFont(LAYOUT_CONFIG.fontPath, { family: 'CustomFont' });
 
+let hasFallbackFont = false;
+if (fs.existsSync(LAYOUT_CONFIG.fallbackFontPath)) {
+  registerFont(LAYOUT_CONFIG.fallbackFontPath, { family: 'FallbackFont' });
+  hasFallbackFont = true;
+  console.log('Fallback font loaded successfully');
+} else {
+  console.warn('Fallback font not found - Unicode characters may not render correctly');
+}
+
+// Helper functions for mixed font rendering
+function needsFallbackFont(char) {
+  if (!hasFallbackFont) return false;
+  const code = char.charCodeAt(0);
+  return code > 0x024F;
+}
+
+function segmentTextByFont(text) {
+  const segments = [];
+  let currentSegment = { text: '', needsFallback: false };
+  
+  for (const char of text) {
+    const charNeedsFallback = needsFallbackFont(char);
+    
+    if (currentSegment.text === '') {
+      currentSegment = { text: char, needsFallback: charNeedsFallback };
+    } else if (currentSegment.needsFallback === charNeedsFallback) {
+      currentSegment.text += char;
+    } else {
+      segments.push(currentSegment);
+      currentSegment = { text: char, needsFallback: charNeedsFallback };
+    }
+  }
+  
+  if (currentSegment.text) {
+    segments.push(currentSegment);
+  }
+  
+  return segments;
+}
+
+function measureMixedText(ctx, text, fontSize) {
+  const segments = segmentTextByFont(text);
+  let totalWidth = 0;
+  
+  for (const segment of segments) {
+    ctx.font = `${fontSize}px ${segment.needsFallback ? 'FallbackFont' : 'CustomFont'}`;
+    totalWidth += ctx.measureText(segment.text).width;
+  }
+  
+  return totalWidth;
+}
+
+function drawMixedText(ctx, text, x, y, fontSize, fillStyle, strokeStyle = null, lineWidth = 0) {
+  const segments = segmentTextByFont(text);
+  let currentX = x;
+  
+  for (const segment of segments) {
+    ctx.font = `${fontSize}px ${segment.needsFallback ? 'FallbackFont' : 'CustomFont'}`;
+    
+    if (strokeStyle && lineWidth > 0) {
+      ctx.strokeStyle = strokeStyle;
+      ctx.lineWidth = lineWidth;
+      ctx.strokeText(segment.text, currentX, y);
+    }
+    
+    ctx.fillStyle = fillStyle;
+    ctx.fillText(segment.text, currentX, y);
+    
+    currentX += ctx.measureText(segment.text).width;
+  }
+}
+
 function fitTextToBox(text, boxWidth, maxLines, initialFontSize) {
   const canvas = createCanvas(boxWidth, 100);
   const ctx = canvas.getContext('2d');
+  
   for (let fontSize = initialFontSize; fontSize >= 1; fontSize -= 2) {
-    ctx.font = `${fontSize}px CustomFont`;
     const words = text.split(' '), lines = []; let currentLine = '';
+    
     for (const word of words) {
       const test = currentLine ? `${currentLine} ${word}` : word;
-      if (ctx.measureText(test).width <= boxWidth) currentLine = test;
+      const testWidth = measureMixedText(ctx, test, fontSize);
+      
+      if (testWidth <= boxWidth) currentLine = test;
       else { lines.push(currentLine); currentLine = word; }
     }
     if (currentLine) lines.push(currentLine);
@@ -57,10 +134,12 @@ function createTextOverlayImage(title, ranks, ranksToShow, targetW, targetH) {
   const boxH = (70 * scale) + textH;
 
   ctx.fillStyle = 'black'; ctx.fillRect(0, 0, targetW, boxH);
-  ctx.fillStyle = 'white'; ctx.font = `${titleRes.fontSize}px CustomFont`;
+  
   let currY = (boxH - textH) / 2;
   titleRes.lines.forEach(l => {
-    ctx.fillText(l, (targetW - ctx.measureText(l).width) / 2, currY);
+    const lineWidth = measureMixedText(ctx, l, titleRes.fontSize);
+    const x = (targetW - lineWidth) / 2;
+    drawMixedText(ctx, l, x, currY, titleRes.fontSize, 'white');
     currY += titleRes.fontSize + (60 * scale);
   });
 
@@ -68,14 +147,25 @@ function createTextOverlayImage(title, ranks, ranksToShow, targetW, targetH) {
     const idx = (ranks.length - ranksToShow) + i;
     const y = (80 * scale) + boxH + (idx * 140 * scale);
     const rRes = fitTextToBox(ranks[idx], 830 * scale, 1, 60 * scale);
+    
+    // Rank number
     ctx.font = `${60 * scale}px CustomFont`;
     ctx.strokeStyle = 'black'; ctx.lineWidth = 12 * scale;
     ctx.strokeText(`${idx + 1}.`, 45 * scale, y);
     ctx.fillStyle = LAYOUT_CONFIG.rankColors[idx] || 'white';
     ctx.fillText(`${idx + 1}.`, 45 * scale, y);
-    ctx.font = `${rRes.fontSize}px CustomFont`;
-    ctx.strokeText(rRes.lines[0], 125 * scale, y);
-    ctx.fillStyle = 'white'; ctx.fillText(rRes.lines[0], 125 * scale, y);
+    
+    // Rank text with mixed fonts
+    drawMixedText(
+      ctx,
+      rRes.lines[0],
+      125 * scale,
+      y,
+      rRes.fontSize,
+      'white',
+      'black',
+      12 * scale
+    );
   }
   return canvas;
 }
@@ -100,14 +190,12 @@ functions.http('processVideos', async (req, res) => {
   const tracker = new ProgressTracker(res);
   
   try {
-    // 1. Download
     tracker.update('Downloading fragments...', 15);
     const local = await Promise.all(filePaths.map(async (fp, i) => {
       const p = `/tmp/i_${i}_${uuidv4()}.mp4`;
       await cacheBucket.file(fp).download({ destination: p }); return p;
     }));
 
-    // 2. Render
     tracker.update('Rendering 720p previews...', 45);
     const processed = await Promise.all(local.map(async (f, i) => {
       const out = `/tmp/p_${i}_${uuidv4()}.mp4`, ov = `/tmp/o_${i}_${uuidv4()}.png`;
@@ -120,13 +208,11 @@ functions.http('processVideos', async (req, res) => {
       return out;
     }));
 
-    // 3. Concat
     tracker.update('Stitching video...', 80);
     const final = `/tmp/f_${uuidv4()}.mp4`, list = `/tmp/l_${uuidv4()}.txt`;
     fs.writeFileSync(list, processed.map(p => `file '${p}'`).join('\n'));
     await new Promise(r => spawn('ffmpeg', ['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-y', final]).on('close', r));
 
-    // 4. Upload
     tracker.update('Finalizing upload...', 95);
     await outputBucket.upload(final, { destination: `${sessionId}.mp4` });
     const [url] = await outputBucket.file(`${sessionId}.mp4`).getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 3600000 });
