@@ -5,6 +5,8 @@ FROM node:20-slim
 RUN apt-get update && apt-get install -y \
   ffmpeg \
   fontconfig \
+  fonts-noto-cjk \
+  fonts-noto-color-emoji \
   && rm -rf /var/lib/apt/lists/*
 
 # Create the directory for custom fonts
@@ -12,7 +14,6 @@ RUN mkdir -p /usr/share/fonts/truetype/custom
 
 # Copy BOTH fonts from your repo into the container
 COPY font.ttf /usr/share/fonts/truetype/custom/font.ttf
-COPY NotoSans-Regular.ttf /usr/share/fonts/truetype/custom/NotoSans-Regular.ttf
 
 # Rebuild font cache
 RUN fc-cache -f -v
