@@ -6,12 +6,13 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { createCanvas, registerFont, loadImage } = require('canvas');
 
+// --- Configuration ---
 const storage = new Storage();
-const cacheBucket = storage.bucket('ranktop-v-cache');
-const outputBucket = storage.bucket('ranktop-v-preview');
+const cacheBucket = storage.bucket('ranktop-v-cache'); // Uploads go here
+const outputBucket = storage.bucket('ranktop-v-preview'); // Final previews go here
 
 const LAYOUT_CONFIG = {
-  fontPath: '/usr/share/fonts/truetype/custom/font.ttf',
+  fontPath: '/usr/share/fonts/truetype/custom/font.ttf', // Ensure this exists in your Docker image
   chineseFont: 'Noto Sans CJK SC',
   rankColors: ['#FFD700', '#C0C0C0', '#CD7F32', 'white', 'white']
 };
@@ -19,16 +20,16 @@ const LAYOUT_CONFIG = {
 const emojiCache = new Map();
 
 // --- Font Registration ---
-if (fs.existsSync(LAYOUT_CONFIG.fontPath)) {
-  registerFont(LAYOUT_CONFIG.fontPath, { family: 'CustomFont' });
-} else {
-  throw new Error(`Main font missing at ${LAYOUT_CONFIG.fontPath}`);
+try {
+  if (fs.existsSync(LAYOUT_CONFIG.fontPath)) {
+    registerFont(LAYOUT_CONFIG.fontPath, { family: 'CustomFont' });
+  }
+} catch (e) {
+  console.warn(`Warning: Main font missing at ${LAYOUT_CONFIG.fontPath}`);
 }
 
 // --- Text & Emoji Utilities ---
-
 function getEmojiUrl(emoji) {
-  // Extract hex code points for Twemoji CDN
   const codePoints = Array.from(emoji)
     .map(c => c.codePointAt(0).toString(16))
     .join('-');
@@ -91,8 +92,6 @@ async function drawMixedText(ctx, text, x, y, fontSize, fillStyle, strokeStyle =
             img = await loadImage(url);
             emojiCache.set(url, img);
           }
-          const emojiSize = fontSize * 1.1;
-          // Vertically center emoji with text
           ctx.drawImage(img, currentX, y + (fontSize * 0.1), fontSize, fontSize);
           currentX += fontSize;
         } catch (e) {
@@ -136,6 +135,7 @@ async function createTextOverlayImage(title, ranks, ranksToShow, targetW, target
   ctx.clearRect(0, 0, targetW, targetH);
   ctx.textBaseline = 'top'; ctx.textAlign = 'left';
 
+  // Draw Title
   const titleRes = fitTextToBox(title, 980 * scale, 2, 100 * scale);
   const textH = (titleRes.lines.length * titleRes.fontSize) + ((titleRes.lines.length - 1) * 60 * scale);
   const boxH = (70 * scale) + textH;
@@ -148,6 +148,7 @@ async function createTextOverlayImage(title, ranks, ranksToShow, targetW, target
     currY += titleRes.fontSize + (60 * scale);
   }
 
+  // Draw Ranks
   for (let i = 0; i < ranksToShow; i++) {
     const idx = (ranks.length - ranksToShow) + i;
     const y = (80 * scale) + boxH + (idx * 140 * scale);
@@ -174,6 +175,7 @@ functions.http('processVideos', async (req, res) => {
   
   if (req.method === 'OPTIONS') return res.status(204).send('');
   
+  // 1. Handle Upload URL Generation
   if (req.body.action === 'getUploadUrls') {
     const { videoCount, sessionId, fileTypes } = req.body;
     const uploadUrls = [], filePaths = [];
@@ -187,6 +189,7 @@ functions.http('processVideos', async (req, res) => {
     return res.json({ uploadUrls, filePaths, sessionId });
   }
 
+  // 2. Handle Video Processing Stream
   res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
   const { sessionId, title, ranks, filePaths } = req.body;
   const tracker = new ProgressTracker(res);
@@ -195,6 +198,8 @@ functions.http('processVideos', async (req, res) => {
   try {
     const totalSteps = filePaths.length;
     tracker.update('Downloading fragments...', 5);
+    
+    // Download source videos
     const local = await Promise.all(filePaths.map(async (fp, i) => {
       const p = `/tmp/i_${i}_${uuidv4()}.mp4`;
       await cacheBucket.file(fp).download({ destination: p });
@@ -216,11 +221,21 @@ functions.http('processVideos', async (req, res) => {
       fs.writeFileSync(ov, overlayCanvas.toBuffer('image/png'));
       
       await new Promise((resolve, reject) => {
+        // Complex filter: Scale video and overlay, then overlay them.
         const filter = `[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280[v];[1:v]scale=720:1280[ov];[v][ov]overlay=0:0`;
+        
         const ff = spawn('ffmpeg', [
-            '-i', f, '-i', ov, '-filter_complex', filter, 
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-y', out
+            '-i', f, 
+            '-i', ov, 
+            '-filter_complex', filter, 
+            '-map', '0:a?', // Preserve audio if it exists
+            '-map', '0:v?', // Fallback map (usually handled by filter, but good practice)
+            '-c:v', 'libx264', 
+            '-preset', 'ultrafast', // Speed priority for previews
+            '-crf', '28', 
+            '-y', out
         ]);
+        
         ff.on('error', reject);
         ff.on('close', c => {
             try { if (fs.existsSync(ov)) fs.unlinkSync(ov); } catch(e) {}
@@ -243,8 +258,9 @@ functions.http('processVideos', async (req, res) => {
     });
 
     tracker.update('Finalizing upload...', 92);
-    await outputBucket.upload(final, { destination: `${sessionId}.mp4` });
-    const [url] = await outputBucket.file(`${sessionId}.mp4`).getSignedUrl({ 
+    const destName = `${sessionId}.mp4`;
+    await outputBucket.upload(final, { destination: destName });
+    const [url] = await outputBucket.file(destName).getSignedUrl({ 
         version: 'v4', action: 'read', expires: Date.now() + 3600000 
     });
     
