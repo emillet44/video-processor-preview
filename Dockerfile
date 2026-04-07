@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y \
 RUN mkdir -p /usr/share/fonts/truetype/custom
 
 # Copy BOTH fonts from your repo into the container
-COPY font.ttf /usr/share/fonts/truetype/custom/font.ttf
+COPY Archivo-Expanded-Bold.ttf /usr/share/fonts/truetype/custom/Archivo-Expanded-Bold.ttf
+COPY Arial-Regular.ttf /usr/share/fonts/truetype/custom/Arial-Regular.ttf
 
 # Rebuild font cache
 RUN fc-cache -f -v
