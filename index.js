@@ -10,22 +10,50 @@ const storage = new Storage();
 const cacheBucket = storage.bucket('ranktop-v-cache');
 const outputBucket = storage.bucket('ranktop-v-preview');
 
-const LAYOUT_CONFIG = {
-  fontPath: '/usr/share/fonts/truetype/custom/font.ttf',
-  chineseFont: 'Noto Sans CJK SC',
-  rankColors: ['#FFD700', '#C0C0C0', '#CD7F32', 'white', 'white'],
+// --- Configuration & Assets ---
+const FONTS = {
+  'Archivo Expanded Bold': '/usr/share/fonts/truetype/custom/font.ttf',
+  'Arial Regular': '/usr/share/fonts/truetype/custom/Arial-Regular.ttf',
 };
 
-const emojiCache = new Map();
-if (fs.existsSync(LAYOUT_CONFIG.fontPath)) {
-  registerFont(LAYOUT_CONFIG.fontPath, { family: 'CustomFont' });
-}
+// Register all available fonts
+Object.entries(FONTS).forEach(([family, p]) => {
+  if (fs.existsSync(p)) {
+    registerFont(p, { family });
+  }
+});
 
-// --- Status Management (File based for previews) ---
-async function updateStatus(sessionId, status, payload = {}) {
-  const file = outputBucket.file(`${sessionId}.json`);
-  const data = JSON.stringify({ status, updatedAt: Date.now(), ...payload });
-  await file.save(data, { contentType: 'application/json' });
+const CHINESE_FONT = 'Noto Sans CJK SC';
+const emojiCache = new Map();
+
+/**
+ * Scales config values for the target render resolution (720p).
+ * Base is 1080p (Original). 720 / 1080 = 0.666...
+ */
+function getScaledSettings(config, targetWidth) {
+  const scale = targetWidth / 1080;
+  return {
+    titleFontSize: (config.titleFontSize ?? 100) * scale,
+    titleLineSpacing: (config.titleLineSpacing ?? 30) * scale,
+    titleBoxWidth: (config.titleBoxWidth ?? 980) * scale,
+    titleMaxLines: config.titleMaxLines ?? 2,
+    titleBoxTopPadding: (config.titleBoxTopPadding ?? 30) * scale,
+    titleBoxBottomPadding: (config.titleBoxBottomPadding ?? 40) * scale,
+    subtitleFontSize: (config.subtitleFontSize ?? 44) * scale,
+    subtitleTopMargin: (config.subtitleTopMargin ?? 10) * scale,
+    rankFontSize: (config.rankFontSize ?? 60) * scale,
+    rankSpacing: (config.rankSpacing ?? 140) * scale,
+    rankPaddingY: (config.rankPaddingY ?? 80) * scale,
+    rankNumX: 45 * scale,
+    rankTextX: 125 * scale,
+    rankBoxWidth: (config.rankBoxWidth ?? 830) * scale,
+    textOutlineWidth: (config.textOutlineWidth ?? (config.fontFamily === 'Arial Regular' ? 9 : 18)) * scale,
+    watermarkFontSize: 48 * scale,
+    watermarkPadding: 20 * scale,
+    creatorWatermarkFontSize: 44 * scale,
+    creatorWatermarkBottomPadding: 80 * scale,
+    scale,
+  };
 }
 
 // --- Text & Emoji Utilities ---
@@ -34,18 +62,18 @@ function getEmojiUrl(emoji) {
   return `https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.0.3/assets/72x72/${codePoints}.png`;
 }
 
-function getFontForChar(char) {
+function getFontForChar(char, primaryFont) {
   if (/\p{Extended_Pictographic}/u.test(char)) return 'Emoji';
-  if (/[\u4e00-\u9fa5]|[\u3040-\u30ff]|[\uff00-\uffef]/.test(char)) return LAYOUT_CONFIG.chineseFont;
-  return 'CustomFont';
+  if (/[\u4e00-\u9fa5]|[\u3040-\u30ff]|[\uff00-\uffef]/.test(char)) return CHINESE_FONT;
+  return primaryFont;
 }
 
-function segmentTextByFont(text) {
+function segmentTextByFont(text, primaryFont) {
   const segments = [];
   if (!text) return segments;
   let currentSegment = { text: '', font: '' };
   for (const char of text) {
-    const fontNeeded = getFontForChar(char);
+    const fontNeeded = getFontForChar(char, primaryFont);
     if (currentSegment.text === '') currentSegment = { text: char, font: fontNeeded };
     else if (currentSegment.font === fontNeeded) currentSegment.text += char;
     else { segments.push(currentSegment); currentSegment = { text: char, font: fontNeeded }; }
@@ -54,8 +82,8 @@ function segmentTextByFont(text) {
   return segments;
 }
 
-function measureMixedText(ctx, text, fontSize) {
-  const segments = segmentTextByFont(text);
+function measureMixedText(ctx, text, fontSize, primaryFont) {
+  const segments = segmentTextByFont(text, primaryFont);
   let totalWidth = 0;
   segments.forEach(s => {
     if (s.font === 'Emoji') totalWidth += (fontSize * Array.from(s.text).length);
@@ -64,8 +92,8 @@ function measureMixedText(ctx, text, fontSize) {
   return totalWidth;
 }
 
-async function drawMixedText(ctx, text, x, y, fontSize, fillStyle, strokeStyle = null, lineWidth = 0) {
-  const segments = segmentTextByFont(text);
+async function drawMixedText(ctx, text, x, y, fontSize, primaryFont, fillStyle, strokeStyle = null, lineWidth = 0) {
+  const segments = segmentTextByFont(text, primaryFont);
   let currentX = x;
   for (const s of segments) {
     if (s.font === 'Emoji') {
@@ -81,227 +109,308 @@ async function drawMixedText(ctx, text, x, y, fontSize, fillStyle, strokeStyle =
       }
     } else {
       ctx.font = `${fontSize}px "${s.font}"`;
-      if (strokeStyle) { ctx.strokeStyle = strokeStyle; ctx.lineWidth = lineWidth; ctx.strokeText(s.text, currentX, y); }
-      ctx.fillStyle = fillStyle; ctx.fillText(s.text, currentX, y);
+      if (strokeStyle && lineWidth > 0) { 
+        ctx.strokeStyle = strokeStyle; 
+        ctx.lineWidth = lineWidth; 
+        ctx.strokeText(s.text, currentX, y); 
+      }
+      ctx.fillStyle = fillStyle; 
+      ctx.fillText(s.text, currentX, y);
       currentX += ctx.measureText(s.text).width;
     }
   }
+  return currentX - x; // return width drawn
 }
 
-function fitTextToBox(text, boxWidth, maxLines, initialFontSize) {
-  const canvas = createCanvas(boxWidth, 100);
-  const ctx = canvas.getContext('2d');
-  for (let fontSize = initialFontSize; fontSize >= 1; fontSize -= 2) {
-    const words = text.split(' '), lines = []; let currentLine = '';
-    for (const word of words) {
-      const test = currentLine ? `${currentLine} ${word}` : word;
-      if (measureMixedText(ctx, test, fontSize) <= boxWidth) currentLine = test;
-      else { lines.push(currentLine); currentLine = word; }
+function wrapText(ctx, text, maxWidth, maxLines, fontSize, primaryFont) {
+  const words = text.split(' ');
+  const lines = [];
+  let currentLine = '';
+
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    const testWidth = measureMixedText(ctx, testLine, fontSize, primaryFont);
+    if (testWidth <= maxWidth) {
+      currentLine = testLine;
+    } else {
+      lines.push(currentLine);
+      currentLine = word;
     }
-    if (currentLine) lines.push(currentLine);
-    if (lines.length <= maxLines) return { fontSize, lines };
+  }
+  if (currentLine) lines.push(currentLine);
+  return lines.slice(0, maxLines);
+}
+
+function fitTextToBox(text, boxWidth, maxLines, initialFontSize, primaryFont) {
+  const canvas = createCanvas(100, 100);
+  const ctx = canvas.getContext('2d');
+  for (let size = initialFontSize; size >= 10; size -= 2) {
+    const lines = wrapText(ctx, text, boxWidth, maxLines, size, primaryFont);
+    if (lines.length <= maxLines) return { fontSize: size, lines };
   }
   return { fontSize: 10, lines: [text] };
 }
 
-// Auto-stitch overlay: title + all revealed ranks so far
-async function createTextOverlayImage(title, ranks, ranksToShow, targetW, targetH) {
+// --- Status Management ---
+async function updateStatus(sessionId, status, payload = {}) {
+  const file = outputBucket.file(`${sessionId}.json`);
+  const data = JSON.stringify({ status, updatedAt: Date.now(), ...payload });
+  await file.save(data, { contentType: 'application/json' });
+}
+
+// --- Rendering Core ---
+
+/**
+ * Generates the full composite overlay image for a frame.
+ * Used for both Auto-stitch (progressive) and Pre-edited (layers).
+ */
+async function createOverlayImage(targetW, targetH, title, ranks, ranksToShow, config) {
   const canvas = createCanvas(targetW, targetH);
   const ctx = canvas.getContext('2d');
-  const scale = targetW / 1080;
+  const S = getScaledSettings(config, targetW);
+  const font = config.fontFamily || 'Archivo Expanded Bold';
+
   ctx.clearRect(0, 0, targetW, targetH);
-  ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
 
-  const titleRes = fitTextToBox(title, 980 * scale, 2, 100 * scale);
-  const textH = (titleRes.lines.length * titleRes.fontSize) + ((titleRes.lines.length - 1) * 60 * scale);
-  const boxH = (70 * scale) + textH;
+  // 1. Title & Subtitle Layout
+  const titleRes = fitTextToBox(title || 'Title', S.titleBoxWidth, S.titleMaxLines, S.titleFontSize, font);
+  const textH = titleRes.lines.length * titleRes.fontSize + (titleRes.lines.length - 1) * S.titleLineSpacing;
+  const subtitleH = config.subtitle ? S.subtitleTopMargin + S.subtitleFontSize : 0;
+  const boxH = S.titleBoxTopPadding + textH + subtitleH + S.titleBoxBottomPadding;
 
-  ctx.fillStyle = 'black'; ctx.fillRect(0, 0, targetW, boxH);
-  let currY = (boxH - textH) / 2;
-  for (const l of titleRes.lines) {
-    const lw = measureMixedText(ctx, l, titleRes.fontSize);
-    await drawMixedText(ctx, l, (targetW - lw) / 2, currY, titleRes.fontSize, 'white');
-    currY += titleRes.fontSize + (60 * scale);
+  // 2. Title Backdrop
+  if (config.titleBackdrop === 'black' || config.titleBackdrop === 'white') {
+    ctx.fillStyle = config.titleBackdrop;
+    ctx.fillRect(0, 0, targetW, boxH);
+  } else if (config.titleBackdrop === 'blurred') {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, targetW, boxH);
   }
 
+  // 3. Render Title (with word colors)
+  const wordColorMap = new Map();
+  (config.titleWordColors || []).forEach(wc => wordColorMap.set(wc.word.toLowerCase(), wc.color));
+
+  let currY = (boxH - subtitleH - textH) / 2;
+  
+  if (config.textShadow !== false && config.titleShadowBlur) {
+    ctx.shadowColor = 'rgba(0,0,0,0.8)';
+    ctx.shadowBlur = config.titleShadowBlur * S.scale;
+  }
+
+  for (const line of titleRes.lines) {
+    const lineWidth = measureMixedText(ctx, line, titleRes.fontSize, font);
+    let currentX = (targetW - lineWidth) / 2;
+    const words = line.split(' ');
+    
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      const displayWord = i < words.length - 1 ? `${word} ` : word;
+      const color = wordColorMap.get(word.toLowerCase()) || 'white';
+      
+      const drawnWidth = await drawMixedText(
+        ctx, displayWord, currentX, currY, titleRes.fontSize, font,
+        color, (config.textShadow !== false ? 'black' : null), S.textOutlineWidth
+      );
+      currentX += drawnWidth;
+    }
+    currY += titleRes.fontSize + S.titleLineSpacing;
+    ctx.shadowBlur = 0;
+  }
+
+  // 4. Subtitle
+  if (config.subtitle) {
+    const subW = measureMixedText(ctx, config.subtitle, S.subtitleFontSize, font);
+    await drawMixedText(
+      ctx, config.subtitle, (targetW - subW) / 2, currY + S.subtitleTopMargin, 
+      S.subtitleFontSize, font, config.subtitleColor || '#CCCCCC',
+      (config.textShadow !== false ? 'black' : null), S.textOutlineWidth * 0.5
+    );
+  }
+
+  // 5. Ranks
   for (let i = 0; i < ranksToShow; i++) {
-    const idx = (ranks.length - ranksToShow) + i;
-    const y = (80 * scale) + boxH + (idx * 140 * scale);
-    const rRes = fitTextToBox(ranks[idx], 830 * scale, 1, 60 * scale);
+    const rankText = ranks[i];
+    if (!rankText) continue;
 
-    ctx.font = `${60 * scale}px "CustomFont"`;
-    ctx.strokeStyle = 'black'; ctx.lineWidth = 12 * scale;
-    ctx.strokeText(`${idx + 1}.`, 45 * scale, y);
-    ctx.fillStyle = LAYOUT_CONFIG.rankColors[idx] || 'white';
-    ctx.fillText(`${idx + 1}.`, 45 * scale, y);
+    const y = S.rankPaddingY + boxH + i * S.rankSpacing;
+    const rankColor = config.rankColors?.[i] ?? 'white';
 
-    await drawMixedText(ctx, rRes.lines[0], 125 * scale, y, rRes.fontSize, 'white', 'black', 12 * scale);
-  }
-  return canvas;
-}
+    if (config.textShadow !== false && config.rankShadowBlur) {
+      ctx.shadowColor = 'rgba(0,0,0,0.8)';
+      ctx.shadowBlur = config.rankShadowBlur * S.scale;
+    }
 
-// --- Pre-edited overlay helpers (preview scale: 720x1280) ---
-const PREVIEW_W = 720, PREVIEW_H = 1280;
-const PREVIEW_SCALE = PREVIEW_W / 1080;
+    // Rank Number
+    await drawMixedText(
+      ctx, `${i + 1}.`, S.rankNumX, y, S.rankFontSize, font,
+      rankColor, (config.textShadow !== false ? 'black' : null), S.textOutlineWidth
+    );
 
-// Returns the title box height at preview scale, mirroring computeTitleBoxH in the final pipeline.
-function computePreviewTitleBoxH(title) {
-  const titleRes = fitTextToBox(title, 980 * PREVIEW_SCALE, 2, 100 * PREVIEW_SCALE);
-  const textH = (titleRes.lines.length * titleRes.fontSize) + ((titleRes.lines.length - 1) * 60 * PREVIEW_SCALE);
-  return { titleRes, boxH: (70 * PREVIEW_SCALE) + textH };
-}
-
-// Base overlay: title box + watermark only, no ranks. Always visible.
-async function createPreviewBaseOverlay(title) {
-  const canvas = createCanvas(PREVIEW_W, PREVIEW_H);
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, PREVIEW_W, PREVIEW_H);
-  ctx.textBaseline = 'top'; ctx.textAlign = 'left';
-
-  const { titleRes, boxH } = computePreviewTitleBoxH(title);
-  const textH = (titleRes.lines.length * titleRes.fontSize) + ((titleRes.lines.length - 1) * 60 * PREVIEW_SCALE);
-
-  ctx.fillStyle = 'black'; ctx.fillRect(0, 0, PREVIEW_W, boxH);
-  let currY = (boxH - textH) / 2;
-  for (const l of titleRes.lines) {
-    const lw = measureMixedText(ctx, l, titleRes.fontSize);
-    await drawMixedText(ctx, l, (PREVIEW_W - lw) / 2, currY, titleRes.fontSize, 'white');
-    currY += titleRes.fontSize + (60 * PREVIEW_SCALE);
+    // Rank Text
+    const rRes = fitTextToBox(rankText, S.rankBoxWidth, 1, S.rankFontSize, font);
+    const centerY = y + (S.rankFontSize - rRes.fontSize) / 2;
+    await drawMixedText(
+      ctx, rRes.lines[0], S.rankTextX, centerY, rRes.fontSize, font,
+      (config.matchRankColor ? rankColor : 'white'),
+      (config.textShadow !== false ? 'black' : null), S.textOutlineWidth
+    );
+    ctx.shadowBlur = 0;
   }
 
-  // Watermark
-  const wmFontSize = 48 * PREVIEW_SCALE;
-  const wmText = 'ranktop.net';
-  const wmW = measureMixedText(ctx, wmText, wmFontSize);
-  ctx.save();
+  // 6. Watermarks
   ctx.globalAlpha = 0.6;
-  await drawMixedText(ctx, wmText, PREVIEW_W - wmW - (20 * PREVIEW_SCALE), PREVIEW_H - wmFontSize - (20 * PREVIEW_SCALE), wmFontSize, 'white', 'black', 12 * PREVIEW_SCALE);
-  ctx.restore();
+  const wmText = 'ranktop.net';
+  const wmW = measureMixedText(ctx, wmText, S.watermarkFontSize, font);
+  await drawMixedText(
+    ctx, wmText, targetW - wmW - S.watermarkPadding, targetH - S.watermarkFontSize - S.watermarkPadding,
+    S.watermarkFontSize, font, 'white', 'black', S.textOutlineWidth
+  );
+
+  if (config.creatorWatermark) {
+    ctx.globalAlpha = 0.7;
+    const cwmW = measureMixedText(ctx, config.creatorWatermark, S.creatorWatermarkFontSize, font);
+    await drawMixedText(
+      ctx, config.creatorWatermark, (targetW - cwmW) / 2, 
+      targetH - S.creatorWatermarkFontSize - S.creatorWatermarkBottomPadding,
+      S.creatorWatermarkFontSize, font, config.creatorWatermarkColor || 'white',
+      'black', S.textOutlineWidth * 0.6
+    );
+  }
 
   return canvas;
 }
 
-// One PNG per rank — only that single rank entry, positioned to align with the base overlay.
-async function createPreviewRankOverlay(ranks, rankIndex, boxH) {
-  const canvas = createCanvas(PREVIEW_W, PREVIEW_H);
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, PREVIEW_W, PREVIEW_H);
-  ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+// --- HTTP Route Handlers ---
 
-  const y = (80 * PREVIEW_SCALE) + boxH + (rankIndex * 140 * PREVIEW_SCALE);
-  const rRes = fitTextToBox(ranks[rankIndex], 830 * PREVIEW_SCALE, 1, 60 * PREVIEW_SCALE);
-
-  ctx.font = `${60 * PREVIEW_SCALE}px "CustomFont"`;
-  ctx.strokeStyle = 'black'; ctx.lineWidth = 12 * PREVIEW_SCALE;
-  ctx.strokeText(`${rankIndex + 1}.`, 45 * PREVIEW_SCALE, y);
-  ctx.fillStyle = LAYOUT_CONFIG.rankColors[rankIndex] || 'white';
-  ctx.fillText(`${rankIndex + 1}.`, 45 * PREVIEW_SCALE, y);
-
-  await drawMixedText(ctx, rRes.lines[0], 125 * PREVIEW_SCALE, y + ((60 * PREVIEW_SCALE - rRes.fontSize) / 2), rRes.fontSize, 'white', 'black', 12 * PREVIEW_SCALE);
-
-  return canvas;
-}
-
-// --- Main HTTP Function ---
 functions.http('processVideos', async (req, res) => {
-  const { action, sessionId } = req.body;
+  const { action, sessionId, layoutConfig = {} } = req.body;
+  const RENDER_W = 720, RENDER_H = 1280;
 
-  // 1. Get Upload URLs for auto-stitch (multiple files)
+  // 1. Utility Handlers
   if (action === 'getUploadUrls') {
     const { videoCount, fileTypes } = req.body;
     const uploadUrls = [], filePaths = [];
     for (let i = 0; i < videoCount; i++) {
       const fileName = `${sessionId}/v_${i}.${(fileTypes?.[i] || 'video/mp4').split('/')[1]}`;
-      const [url] = await cacheBucket.file(fileName).getSignedUrl({
-        version: 'v4', action: 'write', expires: Date.now() + 900000
-      });
+      const [url] = await cacheBucket.file(fileName).getSignedUrl({ version: 'v4', action: 'write', expires: Date.now() + 900000 });
       uploadUrls.push({ index: i, url }); filePaths.push(fileName);
     }
     return res.json({ uploadUrls, filePaths, sessionId });
   }
 
-  // 2. Get Upload URL for pre-edited (single file)
   if (action === 'getUploadUrl') {
     const { fileType } = req.body;
-    if (!sessionId || !fileType) return res.status(400).json({ error: 'Missing sessionId or fileType' });
     const ext = fileType.split('/')[1] || 'mp4';
     const fileName = `${sessionId}/pre_source.${ext}`;
-    const [url] = await cacheBucket.file(fileName).getSignedUrl({
-      version: 'v4', action: 'write', expires: Date.now() + 900000, contentType: fileType
-    });
+    const [url] = await cacheBucket.file(fileName).getSignedUrl({ version: 'v4', action: 'write', expires: Date.now() + 900000, contentType: fileType });
     return res.json({ uploadUrl: url, filePath: fileName });
   }
 
-  // 3. Check Status (polling)
   if (action === 'checkStatus') {
-    try {
-      const file = outputBucket.file(`${sessionId}.json`);
-      const [exists] = await file.exists();
-      if (!exists) return res.json({ status: 'NOT_FOUND' });
-      const [content] = await file.download();
-      return res.json(JSON.parse(content.toString()));
-    } catch (e) {
-      return res.status(500).json({ status: 'ERROR', error: e.message });
-    }
+    const file = outputBucket.file(`${sessionId}.json`);
+    const [exists] = await file.exists();
+    if (!exists) return res.json({ status: 'NOT_FOUND' });
+    const [content] = await file.download();
+    return res.json(JSON.parse(content.toString()));
   }
 
-  // 4. Auto-stitch rendering (triggered via Cloud Task)
-  if (action === 'process') {
-    const { title, ranks, filePaths } = req.body;
+  // 2. Heavy Rendering Pipelines
+  if (action === 'process' || action === 'processPreEdited') {
     const tempFiles = [];
-
     try {
       await updateStatus(sessionId, 'PROCESSING');
 
-      // Download
-      const local = await Promise.all(filePaths.map(async (fp, i) => {
-        const p = `/tmp/i_${i}_${uuidv4()}.mp4`;
-        await cacheBucket.file(fp).download({ destination: p });
-        tempFiles.push(p); return p;
-      }));
+      if (action === 'process') {
+        const { title, ranks, filePaths } = req.body;
+        const localPaths = await Promise.all(filePaths.map(async (fp, i) => {
+          const p = `/tmp/i_${i}_${uuidv4()}.mp4`;
+          await cacheBucket.file(fp).download({ destination: p });
+          tempFiles.push(p); return p;
+        }));
 
-      // Render segments
-      const processed = [];
-      for (let i = 0; i < local.length; i++) {
-        const out = `/tmp/p_${i}_${uuidv4()}.mp4`;
-        const ov = `/tmp/o_${i}_${uuidv4()}.png`;
-        tempFiles.push(out, ov);
+        const processed = [];
+        for (let i = 0; i < localPaths.length; i++) {
+          const out = `/tmp/p_${i}_${uuidv4()}.mp4`;
+          const ov = `/tmp/o_${i}_${uuidv4()}.png`;
+          tempFiles.push(out, ov);
 
-        const overlayCanvas = await createTextOverlayImage(title, ranks, i + 1, PREVIEW_W, PREVIEW_H);
-        fs.writeFileSync(ov, overlayCanvas.toBuffer('image/png'));
+          const canvas = await createOverlayImage(RENDER_W, RENDER_H, title, ranks, i + 1, layoutConfig);
+          fs.writeFileSync(ov, canvas.toBuffer('image/png'));
+
+          await new Promise((resolve, reject) => {
+            const filter = `[0:v]scale=${RENDER_W}:${RENDER_H}:force_original_aspect_ratio=increase,crop=${RENDER_W}:${RENDER_H}[v];[1:v]scale=${RENDER_W}:${RENDER_H}[ov];[v][ov]overlay=0:0`;
+            spawn('ffmpeg', ['-i', localPaths[i], '-i', ov, '-filter_complex', filter, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-y', out])
+              .on('error', reject).on('close', c => (c === 0 ? resolve() : reject(new Error('FFmpeg segment failed'))));
+          });
+          processed.push(out);
+        }
+
+        const final = `/tmp/f_${uuidv4()}.mp4`, list = `/tmp/l_${uuidv4()}.txt`;
+        tempFiles.push(final, list);
+        fs.writeFileSync(list, processed.map(p => `file '${p}'`).join('\n'));
+        await new Promise((resolve, reject) => {
+          spawn('ffmpeg', ['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-y', final])
+            .on('error', reject).on('close', c => (c === 0 ? resolve() : reject(new Error('Stitch failed'))));
+        });
+
+        const destName = `${sessionId}.mp4`;
+        await outputBucket.upload(final, { destination: destName });
+        const [url] = await outputBucket.file(destName).getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 3600000 });
+        await updateStatus(sessionId, 'SUCCESS', { videoUrl: url });
+      }
+
+      if (action === 'processPreEdited') {
+        const { title, ranks, filePath, timestamps, endTime } = req.body;
+        const sourcePath = `/tmp/src_${uuidv4()}.mp4`;
+        await cacheBucket.file(filePath).download({ destination: sourcePath });
+        tempFiles.push(sourcePath);
+
+        const sortedT = [...timestamps].sort((a, b) => a.time - b.time);
+        const finalPath = `/tmp/f_${uuidv4()}.mp4`;
+        tempFiles.push(finalPath);
+
+        const inputArgs = ['-i', sourcePath];
+        const filterParts = [`[0:v]scale=${RENDER_W}:${RENDER_H}:force_original_aspect_ratio=increase,crop=${RENDER_W}:${RENDER_H}[base_v]`];
+        
+        const baseOv = `/tmp/b_${uuidv4()}.png`;
+        tempFiles.push(baseOv);
+        const baseCanvas = await createOverlayImage(RENDER_W, RENDER_H, title, [], 0, layoutConfig);
+        fs.writeFileSync(baseOv, baseCanvas.toBuffer('image/png'));
+        inputArgs.push('-i', baseOv);
+        filterParts.push(`[1:v]scale=${RENDER_W}:${RENDER_H}[base_ov]`, `[base_v][base_ov]overlay=0:0[v_base]`);
+
+        let prevLabel = 'v_base';
+        for (let i = 0; i < ranks.length; i++) {
+          const rankOv = `/tmp/r_${i}_${uuidv4()}.png`;
+          tempFiles.push(rankOv);
+          const rConfig = { ...layoutConfig, titleBackdrop: 'none', subtitle: '', creatorWatermark: '' };
+          const rankCanvas = await createOverlayImage(RENDER_W, RENDER_H, "", ranks, i + 1, rConfig);
+          fs.writeFileSync(rankOv, rankCanvas.toBuffer('image/png'));
+          
+          const inputIdx = i + 2;
+          const start = sortedT[ranks.length - 1 - i]?.time ?? 0;
+          inputArgs.push('-i', rankOv);
+          filterParts.push(`[${inputIdx}:v]scale=${RENDER_W}:${RENDER_H}[r${i}]`);
+          filterParts.push(`[${prevLabel}][r${i}]overlay=0:0:enable='between(t,${start},${endTime})'[v${i}]`);
+          prevLabel = `v${i}`;
+        }
 
         await new Promise((resolve, reject) => {
-          const filter = `[0:v]scale=${PREVIEW_W}:${PREVIEW_H}:force_original_aspect_ratio=increase,crop=${PREVIEW_W}:${PREVIEW_H}[v];[1:v]scale=${PREVIEW_W}:${PREVIEW_H}[ov];[v][ov]overlay=0:0`;
-          const ff = spawn('ffmpeg', [
-            '-i', local[i], '-i', ov, '-filter_complex', filter,
-            '-map', '0:a?', '-map', '0:v?',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-y', out
-          ]);
-          ff.on('error', reject);
-          ff.on('close', c => (c === 0 ? resolve() : reject(new Error(`FFmpeg error ${c}`))));
+          spawn('ffmpeg', [...inputArgs, '-filter_complex', filterParts.join(';'), '-map', `[${prevLabel}]`, '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-y', finalPath] )
+            .on('error', reject).on('close', resolve);
         });
-        processed.push(out);
+
+        const destName = `${sessionId}.mp4`;
+        await outputBucket.upload(finalPath, { destination: destName });
+        const [url] = await outputBucket.file(destName).getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 3600000 });
+        await updateStatus(sessionId, 'SUCCESS', { videoUrl: url });
       }
 
-      // Stitch
-      const final = `/tmp/f_${uuidv4()}.mp4`, list = `/tmp/l_${uuidv4()}.txt`;
-      tempFiles.push(final, list);
-      fs.writeFileSync(list, processed.map(p => `file '${p}'`).join('\n'));
-      await new Promise((resolve, reject) => {
-        spawn('ffmpeg', ['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-y', final])
-          .on('error', reject).on('close', c => (c === 0 ? resolve() : reject(new Error('Stitch failed'))));
-      });
-
-      // Upload & sign
-      const destName = `${sessionId}.mp4`;
-      await outputBucket.upload(final, { destination: destName });
-      const [url] = await outputBucket.file(destName).getSignedUrl({
-        version: 'v4', action: 'read', expires: Date.now() + 3600000
-      });
-
-      await updateStatus(sessionId, 'SUCCESS', { videoUrl: url });
       res.status(200).send('OK');
-
     } catch (e) {
       console.error(e);
       await updateStatus(sessionId, 'FAILED', { error: e.message });
@@ -310,102 +419,5 @@ functions.http('processVideos', async (req, res) => {
       tempFiles.forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {} });
       emojiCache.clear();
     }
-    return;
   }
-
-  // 5. Pre-edited rendering (triggered via Cloud Task)
-  if (action === 'processPreEdited') {
-    const { title, ranks, filePath, timestamps, endTime } = req.body;
-    const tempFiles = [];
-
-    try {
-      await updateStatus(sessionId, 'PROCESSING');
-
-      const parsedRanks = typeof ranks === 'string' ? JSON.parse(ranks) : ranks;
-      const parsedEndTime = typeof endTime === 'string' ? parseFloat(endTime) : endTime;
-      const sortedTimestamps = [...timestamps].sort((a, b) => a.time - b.time);
-
-      // Download source
-      const sourcePath = `/tmp/source_${uuidv4()}${path.extname(filePath) || '.mp4'}`;
-      await cacheBucket.file(filePath).download({ destination: sourcePath });
-      tempFiles.push(sourcePath);
-
-      // Pre-calculate title box height for rank alignment
-      const { boxH } = computePreviewTitleBoxH(title);
-
-      // Base overlay (title + watermark) — always visible, no enable=
-      const basePath = `/tmp/base_${uuidv4()}.png`;
-      tempFiles.push(basePath);
-      fs.writeFileSync(basePath, (await createPreviewBaseOverlay(title)).toBuffer('image/png'));
-
-      // One PNG per rank, mapped in reverse order (highest rank revealed first)
-      const rankPaths = [];
-      for (let i = 0; i < parsedRanks.length; i++) {
-        const rankPath = `/tmp/rank_${i}_${uuidv4()}.png`;
-        tempFiles.push(rankPath);
-        const rankIndex = parsedRanks.length - 1 - i;
-        fs.writeFileSync(rankPath, (await createPreviewRankOverlay(parsedRanks, rankIndex, boxH)).toBuffer('image/png'));
-        rankPaths.push({ path: rankPath, rankIndex, timestampSlot: i });
-      }
-
-      // Single FFmpeg pass — same filter chain logic as the final pipeline
-      const finalPath = `/tmp/f_${uuidv4()}.mp4`;
-      tempFiles.push(finalPath);
-
-      const inputArgs = ['-i', sourcePath, '-i', basePath];
-      for (const { path: rp } of rankPaths) inputArgs.push('-i', rp);
-
-      const filterParts = [
-        `[0:v]scale=${PREVIEW_W}:${PREVIEW_H}:force_original_aspect_ratio=increase,crop=${PREVIEW_W}:${PREVIEW_H}[base_v]`,
-        `[1:v]scale=${PREVIEW_W}:${PREVIEW_H}[base_ov]`,
-        // No enable= on the base overlay — title and watermark are always visible
-        `[base_v][base_ov]overlay=0:0[v_base]`,
-      ];
-      let prevLabel = 'v_base';
-      for (let i = 0; i < rankPaths.length; i++) {
-        const { timestampSlot } = rankPaths[i];
-        const start = sortedTimestamps[timestampSlot]?.time ?? 0;
-        const inputIdx = i + 2;
-        filterParts.push(`[${inputIdx}:v]scale=${PREVIEW_W}:${PREVIEW_H}[r${i}]`);
-        filterParts.push(`[${prevLabel}][r${i}]overlay=0:0:enable='between(t,${start},${parsedEndTime})'[v${i}]`);
-        prevLabel = `v${i}`;
-      }
-
-      await new Promise((resolve, reject) => {
-        const ff = spawn('ffmpeg', [
-          ...inputArgs,
-          '-filter_complex', filterParts.join(';'),
-          '-map', `[${prevLabel}]`,
-          '-map', '0:a?',
-          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
-          '-c:a', 'aac', '-movflags', '+faststart', '-y', finalPath
-        ]);
-        let stderr = '';
-        ff.stderr.on('data', d => { stderr += d.toString(); });
-        ff.on('error', reject);
-        ff.on('close', c => (c === 0 ? resolve() : reject(new Error(`FFmpeg pre-edited failed (${c}): ${stderr.slice(-400)}`))));
-      });
-
-      // Upload & sign
-      const destName = `${sessionId}.mp4`;
-      await outputBucket.upload(finalPath, { destination: destName });
-      const [url] = await outputBucket.file(destName).getSignedUrl({
-        version: 'v4', action: 'read', expires: Date.now() + 3600000
-      });
-
-      await updateStatus(sessionId, 'SUCCESS', { videoUrl: url });
-      res.status(200).send('OK');
-
-    } catch (e) {
-      console.error(e);
-      await updateStatus(sessionId, 'FAILED', { error: e.message });
-      res.status(500).send(e.message);
-    } finally {
-      tempFiles.forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {} });
-      emojiCache.clear();
-    }
-    return;
-  }
-
-  res.status(400).send('Invalid Action');
 });
