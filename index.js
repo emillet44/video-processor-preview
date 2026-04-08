@@ -456,15 +456,33 @@ function downloadWithTimeout(gcsFile, destination, ms, label = 'Download') {
 // ─────────────────────────────────────────────────────────────────────────────
 
 functions.http('processVideos', async (req, res) => {
-  const body = req.body;
-  const { action, sessionId, title, ranks, filePaths, filePath, timestamps, endTime, layoutConfig: rawConfig } = body;
+  let body = req.body;
+  if (Buffer.isBuffer(body)) {
+    try { body = JSON.parse(body.toString()); } catch (e) {}
+  } else if (typeof body === 'string') {
+    try { body = JSON.parse(body); } catch (e) {}
+  }
+
+  const { action, sessionId, title, filePaths, filePath, layoutConfig: rawConfig, videoCount, fileTypes } = body;
+  
+  let ranks = body.ranks || [];
+  if (typeof ranks === 'string') {
+    try { ranks = JSON.parse(ranks); } catch (e) {}
+  }
+
+  let timestamps = body.timestamps || [];
+  if (typeof timestamps === 'string') {
+    try { timestamps = JSON.parse(timestamps); } catch (e) {}
+  }
+
+  let endTime = body.endTime;
+  if (typeof endTime === 'string') endTime = parseFloat(endTime);
   
   const RENDER_W = 720, RENDER_H = 1280;
   const clientConfig = typeof rawConfig === 'string' ? JSON.parse(rawConfig) : (rawConfig || {});
   const activeConfig = resolveLayoutConfig(clientConfig, RENDER_W);
 
   if (action === 'getUploadUrls') {
-    const { videoCount, fileTypes } = body;
     const uploadUrls = [], generatedPaths = [];
     for (let i = 0; i < videoCount; i++) {
       const ext = (fileTypes?.[i] || 'video/mp4').split('/')[1] || 'mp4';
@@ -494,7 +512,6 @@ functions.http('processVideos', async (req, res) => {
     const tempFiles = [];
     try {
       await updateStatus(sessionId, 'PROCESSING', { progress: 5 });
-      const parsedRanks = typeof ranks === 'string' ? JSON.parse(ranks) : ranks;
       const { boxH } = computeTitleBoxH(title, activeConfig);
 
       if (action === 'process') {
@@ -514,7 +531,7 @@ functions.http('processVideos', async (req, res) => {
           const ov = `/tmp/ov_${i}_${uuidv4()}.png`;
           tempFiles.push(out, ov);
 
-          const canvas = await createTextOverlayImage(title, parsedRanks, i + 1, activeConfig);
+          const canvas = await createTextOverlayImage(title, ranks, i + 1, activeConfig);
           fs.writeFileSync(ov, canvas.toBuffer('image/png', { compressionLevel: 3 }));
 
           let filter;
@@ -557,9 +574,6 @@ functions.http('processVideos', async (req, res) => {
       }
 
       if (action === 'processPreEdited') {
-        const parsedEndTime = typeof endTime === 'string' ? parseFloat(endTime) : endTime;
-        const parsedTimestamps = typeof timestamps === 'string' ? JSON.parse(timestamps) : timestamps;
-        
         const sourcePath = `/tmp/src_${uuidv4()}.mp4`;
         await downloadWithTimeout(cacheBucket.file(filePath), sourcePath, 120000, 'Download source');
         tempFiles.push(sourcePath);
@@ -572,20 +586,19 @@ functions.http('processVideos', async (req, res) => {
         const baseCanvas = await createBaseOverlayImage(title, activeConfig);
         fs.writeFileSync(baseOv, baseCanvas.toBuffer('image/png', { compressionLevel: 3 }));
 
-        const sortedTimestamps = [...parsedTimestamps].sort((a, b) => a.time - b.time);
         const rankPaths = [];
 
-        for (let i = 0; i < parsedRanks.length; i++) {
-          const prog = 25 + Math.floor((i / parsedRanks.length) * 35);
+        for (let i = 0; i < ranks.length; i++) {
+          const prog = 25 + Math.floor((i / ranks.length) * 35);
           await updateStatus(sessionId, 'PROCESSING', { progress: prog });
 
           const rankPath = `/tmp/rank_${i}_${uuidv4()}.png`;
           tempFiles.push(rankPath);
 
-          const rankIndex = parsedRanks.length - 1 - i;
-          const rankCanvas = await createRankOverlayImage(parsedRanks, rankIndex, boxH, activeConfig);
+          const rankIndex = ranks.length - 1 - i;
+          const rankCanvas = await createRankOverlayImage(ranks, rankIndex, boxH, activeConfig);
           fs.writeFileSync(rankPath, rankCanvas.toBuffer('image/png', { compressionLevel: 3 }));
-          rankPaths.push({ path: rankPath, rankIndex, timestampSlot: i });
+          rankPaths.push({ path: rankPath, rankIndex });
         }
 
         const inputArgs = ['-threads', '0', '-i', sourcePath, '-i', baseOv];
@@ -611,10 +624,12 @@ functions.http('processVideos', async (req, res) => {
 
         let prevLabel = 'v_base';
         for (let i = 0; i < rankPaths.length; i++) {
-          const { timestampSlot } = rankPaths[i];
-          const start = sortedTimestamps[timestampSlot]?.time ?? 0;
+          const { rankIndex } = rankPaths[i];
+          const timestampObj = timestamps.find(t => t.rankIndex === rankIndex);
+          const start = timestampObj?.time ?? 0;
+
           filterParts.push(`[${i + 2}:v]scale=${RENDER_W}:${RENDER_H}[r${i}]`);
-          filterParts.push(`[${prevLabel}][r${i}]overlay=0:0:enable='between(t,${start},${parsedEndTime})'[v${i}]`);
+          filterParts.push(`[${prevLabel}][r${i}]overlay=0:0:enable='between(t,${start},${endTime})'[v${i}]`);
           prevLabel = `v${i}`;
         }
 
